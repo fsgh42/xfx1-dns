@@ -1,0 +1,8 @@
+.vscode/*
+.git/*
+_out/*
+test/*
+Makefile
+jsonnet/*
+*.md
+*_generate.go

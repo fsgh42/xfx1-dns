@@ -1,0 +1,23 @@
+FROM alpine:3
+
+ARG TARGETARCH=amd64
+
+RUN apk add --no-cache git
+
+# jb v0.6.0 — jsonnet-bundler
+RUN wget -qO /usr/local/bin/jb \
+      "https://github.com/jsonnet-bundler/jsonnet-bundler/releases/download/v0.6.0/jb-linux-${TARGETARCH}" \
+    && chmod +x /usr/local/bin/jb
+
+# jrsonnet 0.5.0-pre96 — asset naming: jrsonnet-linux-{amd64,aarch64}
+RUN wget -qO /usr/local/bin/jrsonnet \
+      "https://github.com/CertainLach/jrsonnet/releases/download/v0.5.0-pre96-test/jrsonnet-linux-${TARGETARCH}" \
+    && chmod +x /usr/local/bin/jrsonnet
+
+# Vendor grafonnet — baked into the image layer, no network needed at render time
+WORKDIR /vendor
+COPY jsonnetfile.json .
+RUN jb install && chmod -R a+rX /vendor
+
+WORKDIR /work
+ENTRYPOINT ["jrsonnet"]

@@ -1,0 +1,174 @@
+version: '3'
+
+vars:
+  CLUSTER_NAME: xfx1-dns-test
+  STATE_DIR: '/tmp/talos-{{.CLUSTER_NAME}}'
+  TALOSCONFIG: '{{.ROOT_DIR}}/_out/test/talosconfig'
+  KUBECONFIG: '{{.ROOT_DIR}}/_out/test/kubeconfig'
+  REGPROXY_IP: '10.5.0.1'
+  # First worker node IP assigned by the QEMU provisioner (10.5.0.2 is the controlplane).
+  NS1_IP: '{{.NS1_IP | default "10.5.0.3"}}'
+
+tasks:
+  cluster:up:
+    desc: create QEMU Talos cluster (1 controlplane, 3 workers)
+    cmds:
+      - mkdir -p {{.ROOT_DIR}}/_out/test
+      - >-
+        cd {{.ROOT_DIR}}/_out/test &&
+        sudo --preserve-env=HOME talosctl cluster create qemu
+        --name {{.CLUSTER_NAME}}
+        --state {{.STATE_DIR}}
+        --presets disk-image
+        --controlplanes 1
+        --workers 3
+        --cpus-controlplanes 2.0
+        --cpus-workers 2.0
+        --memory-controlplanes 4GiB
+        --memory-workers 4GiB
+        --disks virtio:20GiB
+        --config-patch @{{.ROOT_DIR}}/test/patch-dns.yaml
+        --config-patch '{"machine":{"registries":{"mirrors":{"docker.io":{"endpoints":["http://{{.REGPROXY_IP}}:5000","https://registry-1.docker.io"]},"registry.k8s.io":{"endpoints":["http://{{.REGPROXY_IP}}:5001","https://registry.k8s.io"]},"gcr.io":{"endpoints":["http://{{.REGPROXY_IP}}:5003","https://gcr.io"]},"ghcr.io":{"endpoints":["http://{{.REGPROXY_IP}}:5004","https://ghcr.io"]},"factory.talos.dev":{"endpoints":["http://{{.REGPROXY_IP}}:5005","https://factory.talos.dev"]},"quay.io":{"endpoints":["http://{{.REGPROXY_IP}}:5006","https://quay.io"]},"cr.xfx1.de":{"endpoints":["http://{{.NS1_IP}}:5000"],"skipFallback":true}},"config":{"{{.NS1_IP}}:5000":{"tls":{"insecureSkipVerify":true}}}}}}'
+        --talosconfig-destination {{.TALOSCONFIG}}
+      - sudo chown $(id -u):$(id -g) {{.TALOSCONFIG}}
+      - sudo chmod 640 {{.TALOSCONFIG}}
+      - task: cluster:kubeconfig
+      - task: cluster:members
+
+  cluster:kubeconfig:
+    desc: fetch kubeconfig from cluster controlplane
+    vars:
+      CP_IP:
+        sh: >-
+          yq '.contexts[.context].endpoints[0]' {{.TALOSCONFIG}}
+    cmds:
+      - >-
+        talosctl --talosconfig {{.TALOSCONFIG}}
+        -n {{.CP_IP}}
+        kubeconfig {{.KUBECONFIG}} --merge=false --force
+
+  cluster:members:
+    desc: show cluster node IPs (talosctl get members)
+    vars:
+      CP_IP:
+        sh: >-
+          yq '.contexts[.context].endpoints[0]' {{.TALOSCONFIG}}
+    cmds:
+      - talosctl --talosconfig {{.TALOSCONFIG}} -n {{.CP_IP}} get members
+
+  cluster:down:
+    desc: destroy QEMU Talos cluster and remove state
+    cmds:
+      - >-
+        sudo --preserve-env=HOME talosctl cluster destroy
+        --name {{.CLUSTER_NAME}}
+        --state {{.STATE_DIR}}
+        --provisioner qemu
+        --force
+
+  deploy:render:
+    desc: render test/deployment.jsonnet to _out/test/deploy/ without applying
+    vars:
+      ZONE: '{{.ZONE | default "example.com."}}'
+      IMAGE_TAG: '{{.IMAGE_TAG | default "local"}}'
+      # Forward the local cr.xfx1.de credential (if present) so test pods can
+      # pull private images. Empty when not logged in or when a credential
+      # helper is used, in which case no imagePullSecret is rendered.
+      REGISTRY_AUTH:
+        sh: yq '.auths["cr.xfx1.de"].auth' -P "$HOME/.docker/config.json" 2>/dev/null | grep -v '^null$' || true
+    cmds:
+      - mkdir -p {{.ROOT_DIR}}/_out/test/deploy
+      - >-
+        jrsonnet -y -c -m {{.ROOT_DIR}}/_out/test/deploy
+        --tla-str zone={{.ZONE}}
+        --tla-str ns1ip={{.NS1_IP}}
+        --tla-str imageTag={{.IMAGE_TAG}}
+        --tla-str imagePullSecret={{if .REGISTRY_AUTH}}regcred{{end}}
+        --tla-str registryServer=cr.xfx1.de
+        --tla-str registryAuth={{.REGISTRY_AUTH}}
+        {{.ROOT_DIR}}/test/deployment.jsonnet
+
+  deploy:registry:
+    desc: apply in-cluster image registry and wait for it to be ready
+    cmds:
+      - >-
+        kubectl --kubeconfig={{.KUBECONFIG}}
+        apply --server-side -f {{.ROOT_DIR}}/_out/test/deploy/registry/registry.yaml
+      - >-
+        kubectl --kubeconfig={{.KUBECONFIG}}
+        -n registry wait deployment/registry
+        --for=condition=Available --timeout=120s
+
+  image:push:
+    desc: build and push xfx1-dns images directly to in-cluster registry at {{.NS1_IP}}:5000
+    vars:
+      IMAGE_TAG: '{{.IMAGE_TAG | default "local"}}'
+    cmds:
+      - >-
+        jrsonnet
+        '--tla-code=config={image:{base:"{{.NS1_IP}}:5000/infrastructure/xfx1-dns",tag:"{{.IMAGE_TAG}}"},output:"type=image,push=true,registry.insecure=true",platforms:["linux/amd64"]}'
+        {{.ROOT_DIR}}/docker-bake.jsonnet
+        | docker buildx bake -f - --builder={{.BUILDER_NAME}}
+
+  deploy:test:
+    desc: render, deploy registry, push images, then apply full test deployment
+    vars:
+      ZONE: '{{.ZONE | default "example.com."}}'
+      IMAGE_TAG: '{{.IMAGE_TAG | default "local"}}'
+    cmds:
+      - task: deploy:render
+        vars:
+          ZONE: '{{.ZONE}}'
+          IMAGE_TAG: '{{.IMAGE_TAG}}'
+      - task: deploy:registry
+      - task: image:push
+        vars: {IMAGE_TAG: '{{.IMAGE_TAG}}'}
+      - >-
+        kustomize build --enable-helm {{.ROOT_DIR}}/_out/test/deploy
+        | yq 'select(.kind == "CustomResourceDefinition" or .kind == "Namespace")'
+        | kubectl --kubeconfig={{.KUBECONFIG}} apply --server-side -f -
+      - >-
+        kustomize build --enable-helm {{.ROOT_DIR}}/_out/test/deploy
+        | yq 'select(.kind != "CustomResourceDefinition" and .kind != "Namespace")'
+        | kubectl --kubeconfig={{.KUBECONFIG}} apply --server-side -f -
+
+  run:test:
+    desc: >-
+      deploy the in-cluster test Job (KUBECONFIG required).
+      Accepts IMAGE_TAG, ENDPOINT_MODE, TLS_INSECURE, DNSSEC, DOH, DOT overrides.
+    vars:
+      _NS: '{{.NAMESPACE | default "xfx1-dns"}}'
+      _TAG: '{{.IMAGE_TAG | default "local"}}'
+      _MODE: '{{.ENDPOINT_MODE | default "internal"}}'
+      _INSECURE: '{{.TLS_INSECURE | default "0"}}'
+      _DNSSEC: '{{.DNSSEC | default "1"}}'
+      _DOH: '{{.DOH | default "1"}}'
+      _DOT: '{{.DOT | default "1"}}'
+      # Forward the local cr.xfx1.de credential (if present); empty otherwise.
+      REGISTRY_AUTH:
+        sh: yq '.auths["cr.xfx1.de"].auth' -P "$HOME/.docker/config.json" 2>/dev/null | grep -v '^null$' || true
+    cmds:
+      # Delete any previous run so the Job can be re-applied cleanly.
+      - >-
+        kubectl --kubeconfig={{.KUBECONFIG}}
+        delete job xfx1-dns-test -n {{._NS}} 2>/dev/null || true
+      - >-
+        jrsonnet -y
+        --tla-str namespace={{._NS}}
+        --tla-str imageTag={{._TAG}}
+        --tla-str endpointMode={{._MODE}}
+        --tla-str tlsInsecure={{._INSECURE}}
+        --tla-str dnssec={{._DNSSEC}}
+        --tla-str doh={{._DOH}}
+        --tla-str dot={{._DOT}}
+        --tla-str imagePullSecret={{if .REGISTRY_AUTH}}regcred{{end}}
+        --tla-str registryServer=cr.xfx1.de
+        --tla-str registryAuth={{.REGISTRY_AUTH}}
+        {{.ROOT_DIR}}/test/test.jsonnet
+        | kubectl --kubeconfig={{.KUBECONFIG}} apply -f -
+      - >-
+        kubectl --kubeconfig={{.KUBECONFIG}}
+        wait -n xfx1-dns --for=condition=Complete --timeout=30s Job xfx1-dns-test
+      - >-
+        kubectl --kubeconfig={{.KUBECONFIG}}
+        -n xfx1-dns logs jobs/xfx1-dns-test

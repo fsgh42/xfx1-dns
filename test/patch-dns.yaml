@@ -1,0 +1,10 @@
+machine:
+  features:
+    hostDNS:
+      enabled: false
+      forwardKubeDNSToHost: false
+---
+apiVersion: v1alpha1
+kind: ResolverConfig
+nameservers:
+    - address: 8.8.8.8

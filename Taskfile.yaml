@@ -1,0 +1,242 @@
+version: '3'
+
+includes:
+  test:
+    taskfile: test/Taskfile.yaml
+    dir: '{{.ROOT_DIR}}'
+
+vars:
+  IMAGE: cr.xfx1.de/infrastructure/xfx1-dns
+  DASHBOARD_IMAGE: xfx1-dns-dashboard-builder
+  IMAGE_TAG: '{{.IMAGE_TAG | default "local"}}'
+  GO_VERSION:
+    sh: awk '$1 == "go" {print $2}' go.mod
+  GOLANG_IMAGE: 'golang:{{.GO_VERSION}}-alpine'
+  BUILDER_NAME: xfx1-dns
+  CACHE_DIR: '{{.ROOT_DIR}}/_out/cache'
+  _GIT_COMMIT:
+    sh: echo "${GIT_COMMIT:-$(git rev-parse --short HEAD)}"
+  _GIT_TAG:
+    sh: echo "${GIT_TAG:-$(git describe --tags --exact-match 2>/dev/null || echo '')}"
+  _GIT_DIRTY:
+    sh: '[ -n "$GIT_COMMIT" ] || [ -z "$(git status --porcelain 2>/dev/null)" ] || echo "-dirty"'
+  GIT_COMMIT: '{{._GIT_COMMIT}}{{._GIT_DIRTY}}'
+  GIT_TAG: '{{._GIT_TAG}}'
+
+tasks:
+  default:
+    desc: fmt, test, build images
+    deps: [fmt, test, image]
+
+  fmt:
+    desc: format all Go source
+    deps: [builder]
+    vars:
+      FMT_IMAGE: '{{.IMAGE_TAG}}/fmt:local'
+    cmds:
+      - mkdir -p {{.CACHE_DIR}}/fmt
+      - >-
+        docker buildx build
+        --builder={{.BUILDER_NAME}}
+        --build-arg GO_VERSION={{.GO_VERSION}}
+        --cache-from=type=local,src={{.CACHE_DIR}}/fmt
+        --cache-to=type=local,dest={{.CACHE_DIR}}/fmt,mode=max
+        --load
+        -t {{.FMT_IMAGE}}
+        -f fmt.Dockerfile
+        .
+      - >-
+        docker run --rm
+        -v {{.ROOT_DIR}}:/src:rw
+        {{.FMT_IMAGE}}
+        sh -c "golines -w --max-len=80 . && gofumpt -w . && wsl --fix ./..."
+
+  vet:
+    desc: run go vet
+    cmds:
+      - go vet ./...
+
+  bench:
+    desc: run benchmarks in a container (BENCH=regexp to filter, default all)
+    vars:
+      BENCH: '{{.BENCH | default "."}}'
+    cmds:
+      - mkdir -p {{.CACHE_DIR}}
+      - >-
+        docker run --rm
+        -e GOCACHE=/cache
+        -v {{.CACHE_DIR}}:/cache:rw
+        -v {{.ROOT_DIR}}:/src:ro
+        -w /src
+        {{.GOLANG_IMAGE}}
+        go test ./... -run='^$' -bench={{.BENCH}} -benchmem
+
+  coverage:
+    desc: run tests with coverage and write _out/coverage.html
+    cmds:
+      - mkdir -p _out
+      - go test -coverprofile=_out/coverage.out ./...
+      - go tool cover -html=_out/coverage.out -o _out/coverage.html
+
+  license:
+    desc: check all Go files carry the SPDX license header
+    cmds:
+      - >-
+        sh -c "! find .  -name '*.go' -not -path './_out/*' -exec grep -L 'SPDX-License-Identifier: AGPL-3.0-only' {} \; | grep ."
+
+  test:
+    desc: run tests inside a container
+    deps: [license]
+    cmds:
+      - mkdir -p {{.CACHE_DIR}}
+      - >-
+        docker run --rm
+        -e GOCACHE=/cache
+        -v {{.CACHE_DIR}}:/cache:rw
+        -v {{.ROOT_DIR}}:/src:ro
+        -w /src
+        {{.GOLANG_IMAGE}}
+        go test ./...
+
+  fuzz:
+    desc: run go fuzz targets in a non-root container (FUZZTIME=30s default)
+    deps: [builder]
+    vars:
+      FUZZTIME: '{{.FUZZTIME | default "30s"}}'
+      FUZZ_IMAGE: '{{.IMAGE_TAG}}/fuzz:local'
+      HOST_UID:
+        sh: id -u
+      HOST_GID:
+        sh: id -g
+    cmds:
+      - mkdir -p {{.CACHE_DIR}}/fuzz-image
+      # Build a tiny image that runs as the host user so crash artifacts written
+      # to testdata/fuzz/<Target>/ and the working corpus under _out/cache/
+      # are owned by the host user (matches fmt.Dockerfile's pattern).
+      - >-
+        docker buildx build
+        --builder={{.BUILDER_NAME}}
+        --build-arg GO_VERSION={{.GO_VERSION}}
+        --build-arg UID={{.HOST_UID}}
+        --build-arg GID={{.HOST_GID}}
+        --cache-from=type=local,src={{.CACHE_DIR}}/fuzz-image
+        --cache-to=type=local,dest={{.CACHE_DIR}}/fuzz-image,mode=max
+        --load
+        -t {{.FUZZ_IMAGE}}
+        -f fuzz.Dockerfile
+        .
+      # Fix ownership of fuzz corpus cache in case a previous run (as root) left
+      # it unwritable by the container user.
+      - >-
+        docker run --rm
+        -u 0
+        -v {{.CACHE_DIR}}:/cache
+        {{.FUZZ_IMAGE}}
+        sh -c 'mkdir -p /cache/fuzz && chown -R {{.HOST_UID}}:{{.HOST_GID}} /cache'
+      # /src mounted rw so the fuzzer can persist crash artifacts to
+      # testdata/fuzz/<Target>/. Each invocation can target only one fuzz
+      # function, so add another cmd line per new target as it lands.
+      - >-
+        docker run --rm
+        -e GOCACHE=/cache
+        -v {{.CACHE_DIR}}:/cache:rw
+        -v {{.ROOT_DIR}}:/src:rw
+        {{.FUZZ_IMAGE}}
+        go test -run='^$' -fuzz=FuzzNew -fuzztime={{.FUZZTIME}} ./internal/dns/query
+      - >-
+        docker run --rm
+        -e GOCACHE=/cache
+        -v {{.CACHE_DIR}}:/cache:rw
+        -v {{.ROOT_DIR}}:/src:rw
+        {{.FUZZ_IMAGE}}
+        go test -run='^$' -fuzz=FuzzNewDomain -fuzztime={{.FUZZTIME}} ./internal/rec
+      - >-
+        docker run --rm
+        -e GOCACHE=/cache
+        -v {{.CACHE_DIR}}:/cache:rw
+        -v {{.ROOT_DIR}}:/src:rw
+        {{.FUZZ_IMAGE}}
+        go test -run='^$' -fuzz=FuzzParseOPT -fuzztime={{.FUZZTIME}} ./internal/slave
+      - >-
+        docker run --rm
+        -e GOCACHE=/cache
+        -v {{.CACHE_DIR}}:/cache:rw
+        -v {{.ROOT_DIR}}:/src:rw
+        {{.FUZZ_IMAGE}}
+        go test -run='^$' -fuzz=FuzzHandleDNS_NoDB -fuzztime={{.FUZZTIME}} ./internal/slave
+
+  builder:
+    desc: create buildx builder if it does not exist
+    run: once
+    cmds:
+      - >-
+        docker buildx inspect {{.BUILDER_NAME}} >/dev/null 2>&1 ||
+        docker buildx create
+        --name={{.BUILDER_NAME}}
+        --driver=docker-container
+        --platform=linux/amd64,linux/arm64
+        --bootstrap
+
+  image:
+    desc: build container images for all components (local, no push)
+    deps: [builder, license]
+    cmds:
+      - >-
+        jrsonnet --tla-code=config='{git:{commit:"{{.GIT_COMMIT}}",tag:"{{.GIT_TAG}}"}}' docker-bake.jsonnet |
+        docker buildx bake
+        -f -
+        --builder={{.BUILDER_NAME}}
+      - >-
+        echo "built:" &&
+        jrsonnet docker-bake.jsonnet |
+        jq -r '.target[].tags[]'
+
+  push:
+    desc: build and push container images (IMAGE_TAG must not be "local")
+    deps: [builder, license]
+    preconditions:
+      - sh: test "{{.IMAGE_TAG}}" != "local"
+        msg: 'Refusing to push with IMAGE_TAG=local. Set IMAGE_TAG=<version>.'
+    cmds:
+      - >-
+        jrsonnet
+        --tla-code=config='{image+:{tag:"{{.IMAGE_TAG}}"},git:{commit:"{{.GIT_COMMIT}}",tag:"{{.GIT_TAG}}"},output:"type=image,push=true"}'
+        docker-bake.jsonnet |
+        docker buildx bake
+        -f -
+        --builder={{.BUILDER_NAME}}
+      - >-
+        echo "pushed:" &&
+        jrsonnet
+        --tla-code=config='{image+:{tag:"{{.IMAGE_TAG}}"}}'
+        docker-bake.jsonnet |
+        jq -r '.target[].tags[]'
+
+  dashboard:image:
+    desc: build the dashboard builder image (jrsonnet + jb + grafonnet vendor baked in)
+    cmds:
+      - docker build -f {{.ROOT_DIR}}/dashboards/Dockerfile.build -t {{.DASHBOARD_IMAGE}} {{.ROOT_DIR}}/dashboards
+
+  dashboard:build:
+    desc: render Grafana dashboard to deploy/dashboard.json
+    deps: [dashboard:image]
+    cmds:
+      - mkdir -p {{.ROOT_DIR}}/deploy
+      - >-
+        docker run --rm
+        -v {{.ROOT_DIR}}/dashboards:/work:ro
+        {{.DASHBOARD_IMAGE}}
+        -J /vendor/vendor /work/dashboard.jsonnet
+        > {{.ROOT_DIR}}/deploy/dashboard.json
+
+  crds:
+    desc: render crds.jsonnet → deploy/crds.yaml
+    cmds:
+      - mkdir -p {{.ROOT_DIR}}/deploy
+      - jrsonnet --yaml-stream crds.jsonnet > {{.ROOT_DIR}}/deploy/crds.yaml
+
+  clean:
+    desc: remove build cache and builder
+    cmds:
+      - rm -rf _out/
+      - docker buildx rm {{.BUILDER_NAME}} || true
